@@ -197,6 +197,93 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
 
+    def test_snapshot_download_returns_fixed_summary_over_http(self) -> None:
+        admin = self._create_user(
+            "admin-a", ["institution_admin"], "inst-a", "tok-admin"
+        )
+        status, mat = admin.request(
+            "POST", "/v1/materials", {"kind": "syllabus", "title": "大纲"}
+        )
+        self.assertEqual(status, 201)
+        status, ver = admin.request(
+            "POST", f"/v1/materials/{mat['material_id']}/versions",
+            {"content_base64": base64.b64encode(b"v1").decode("ascii")},
+        )
+        self.assertEqual(status, 201)
+
+        status, snap = admin.request(
+            "POST", "/v1/snapshots",
+            {"filters": {"kind": "syllabus"}},
+            idempotency_key="snap-1",
+        )
+        self.assertEqual(status, 201, snap)
+        sid = snap["snapshot_id"]
+        self.assertEqual(snap["status"], "frozen")
+        self.assertEqual(snap["row_count"], 1)
+
+        # 幂等重放同一快照
+        status, snap2 = admin.request(
+            "POST", "/v1/snapshots",
+            {"filters": {"kind": "syllabus"}},
+            idempotency_key="snap-1",
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(snap2["snapshot_id"], sid)
+        self.assertTrue(snap2["replayed"])
+
+        status, payload1, headers1 = admin.request(
+            "GET", f"/v1/snapshots/{sid}/summary", raw=True
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(headers1["X-Snapshot-Fingerprint"], snap["fingerprint"])
+        summary1 = json.loads(payload1.decode("utf-8"))
+        self.assertEqual(summary1["fingerprint"], snap["fingerprint"])
+        self.assertEqual(summary1["rows"][0]["version_id"], ver["version_id"])
+
+        # 快照生成后改变源数据：新版本 + 撤回 + 新材料
+        status, _ = admin.request(
+            "POST", f"/v1/materials/{mat['material_id']}/versions",
+            {"content_base64": base64.b64encode(b"v2 changed").decode("ascii")},
+        )
+        self.assertEqual(status, 201)
+        status, _ = admin.request(
+            "POST", f"/v1/versions/{ver['version_id']}/withdraw", {}
+        )
+        self.assertEqual(status, 200)
+        status, mat2 = admin.request(
+            "POST", "/v1/materials", {"kind": "faculty", "title": "师资"}
+        )
+        self.assertEqual(status, 201)
+        status, _ = admin.request(
+            "POST", f"/v1/materials/{mat2['material_id']}/versions",
+            {"content_base64": base64.b64encode(b"new").decode("ascii")},
+        )
+        self.assertEqual(status, 201)
+
+        # 已报送摘要字节不变
+        status, payload2, headers2 = admin.request(
+            "GET", f"/v1/snapshots/{sid}/summary", raw=True
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload2, payload1)
+        self.assertEqual(headers2["X-Snapshot-Fingerprint"], snap["fingerprint"])
+
+        # 快照详情与列表可读
+        status, detail = admin.request("GET", f"/v1/snapshots/{sid}")
+        self.assertEqual(status, 200)
+        self.assertEqual(detail["fingerprint"], snap["fingerprint"])
+        status, listing = admin.request("GET", "/v1/snapshots")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(listing["snapshots"]), 1)
+
+        # 外机构用户不可读
+        other = self._create_user(
+            "admin-b", ["institution_admin"], "inst-b", "tok-admin-b"
+        )
+        status, body = other.request("GET", f"/v1/snapshots/{sid}/summary")
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"]["code"], "permission_denied")
+
 
 if __name__ == "__main__":
     unittest.main()

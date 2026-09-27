@@ -22,12 +22,15 @@ from ..domain.models import (
     MaterialVersion,
     Objection,
     PackageEntry,
+    ReportSnapshot,
     ReviewPackage,
     ReviewRequest,
+    SnapshotFrozenRow,
     User,
 )
+from ..domain.snapshot import CurrentVersionRow
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class SqliteRepository(Repository):
@@ -176,7 +179,39 @@ class SqliteRepository(Repository):
                     created_at  TEXT NOT NULL
                 );
 
-                PRAGMA user_version = 1;
+                -- 报送快照：筛选条件与数据版本冻结（schema v2）。
+                -- 冻结行不与源表建外键：源行/版本事后被撤回或清理，
+                -- 也不能改变、删除已经报送的快照。
+                CREATE TABLE IF NOT EXISTS report_snapshots (
+                    snapshot_id       TEXT PRIMARY KEY,
+                    scope             TEXT NOT NULL,
+                    institution_id    TEXT NOT NULL DEFAULT '',
+                    filters_json      TEXT NOT NULL,
+                    status            TEXT NOT NULL,
+                    created_by        TEXT NOT NULL,
+                    created_at        TEXT NOT NULL,
+                    fingerprint       TEXT NOT NULL,
+                    row_count         INTEGER NOT NULL,
+                    deadline_at_utc   TEXT,
+                    deadline_timezone TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS snapshot_frozen_rows (
+                    snapshot_id    TEXT NOT NULL,
+                    material_id    TEXT NOT NULL,
+                    institution_id TEXT NOT NULL,
+                    kind           TEXT NOT NULL,
+                    sensitivity    TEXT NOT NULL,
+                    title          TEXT NOT NULL,
+                    version_id     TEXT NOT NULL,
+                    version_no     INTEGER NOT NULL,
+                    sha256         TEXT NOT NULL,
+                    size           INTEGER NOT NULL,
+                    withdrawn      INTEGER NOT NULL,
+                    PRIMARY KEY (snapshot_id, material_id)
+                );
+
+                PRAGMA user_version = 2;
             """
         )
 
@@ -663,6 +698,161 @@ class SqliteRepository(Repository):
                 action=r["action"],
                 at=r["at"],
                 detail=json.loads(r["detail_json"]),
+            )
+            for r in rows
+        ]
+
+    # ------------------------------------------------------------- 报送快照
+    def insert_snapshot(self, snapshot: ReportSnapshot) -> None:
+        self._conn.execute(
+            "INSERT INTO report_snapshots(snapshot_id, scope, institution_id,"
+            " filters_json, status, created_by, created_at, fingerprint,"
+            " row_count, deadline_at_utc, deadline_timezone)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                snapshot.snapshot_id,
+                snapshot.scope,
+                snapshot.institution_id,
+                json.dumps(snapshot.filters, ensure_ascii=False, sort_keys=True),
+                snapshot.status,
+                snapshot.created_by,
+                snapshot.created_at,
+                snapshot.fingerprint,
+                snapshot.row_count,
+                snapshot.deadline_at_utc,
+                snapshot.deadline_timezone,
+            ),
+        )
+
+    def insert_snapshot_rows(self, rows: list[SnapshotFrozenRow]) -> None:
+        self._conn.executemany(
+            "INSERT INTO snapshot_frozen_rows(snapshot_id, material_id,"
+            " institution_id, kind, sensitivity, title, version_id, version_no,"
+            " sha256, size, withdrawn) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            [
+                (
+                    r.snapshot_id,
+                    r.material_id,
+                    r.institution_id,
+                    r.kind,
+                    r.sensitivity,
+                    r.title,
+                    r.version_id,
+                    r.version_no,
+                    r.sha256,
+                    r.size,
+                    int(r.withdrawn),
+                )
+                for r in rows
+            ],
+        )
+
+    def _row_to_snapshot(self, row: sqlite3.Row) -> ReportSnapshot:
+        return ReportSnapshot(
+            snapshot_id=row["snapshot_id"],
+            scope=row["scope"],
+            institution_id=row["institution_id"],
+            filters=json.loads(row["filters_json"]),
+            status=row["status"],
+            created_by=row["created_by"],
+            created_at=row["created_at"],
+            fingerprint=row["fingerprint"],
+            row_count=row["row_count"],
+            deadline_at_utc=row["deadline_at_utc"],
+            deadline_timezone=row["deadline_timezone"],
+        )
+
+    def get_snapshot(self, snapshot_id: str) -> ReportSnapshot | None:
+        row = self._conn.execute(
+            "SELECT * FROM report_snapshots WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchone()
+        return None if row is None else self._row_to_snapshot(row)
+
+    def list_snapshots(
+        self, institution_id: str | None = None,
+    ) -> list[ReportSnapshot]:
+        if institution_id is None:
+            rows = self._conn.execute(
+                "SELECT * FROM report_snapshots ORDER BY created_at, snapshot_id"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM report_snapshots WHERE institution_id = ?"
+                " ORDER BY created_at, snapshot_id",
+                (institution_id,),
+            ).fetchall()
+        return [self._row_to_snapshot(r) for r in rows]
+
+    def get_snapshot_rows(self, snapshot_id: str) -> list[SnapshotFrozenRow]:
+        rows = self._conn.execute(
+            "SELECT * FROM snapshot_frozen_rows WHERE snapshot_id = ?"
+            " ORDER BY material_id",
+            (snapshot_id,),
+        ).fetchall()
+        return [
+            SnapshotFrozenRow(
+                snapshot_id=r["snapshot_id"],
+                material_id=r["material_id"],
+                institution_id=r["institution_id"],
+                kind=r["kind"],
+                sensitivity=r["sensitivity"],
+                title=r["title"],
+                version_id=r["version_id"],
+                version_no=r["version_no"],
+                sha256=r["sha256"],
+                size=r["size"],
+                withdrawn=bool(r["withdrawn"]),
+            )
+            for r in rows
+        ]
+
+    def select_current_versions_for_snapshot(
+        self,
+        *,
+        institution_id: str | None,
+        kind: str | None,
+        sensitivity: str | None,
+        include_withdrawn: bool,
+    ) -> list[CurrentVersionRow]:
+        """快照生成时唯一一次读取源数据：每份材料的当前版本。"""
+        sql = [
+            "SELECT m.material_id AS material_id, m.institution_id AS institution_id,",
+            "       m.kind AS kind, m.sensitivity AS sensitivity, m.title AS title,",
+            "       m.withdrawn AS material_withdrawn,",
+            "       v.version_id AS version_id, v.version_no AS version_no,",
+            "       v.sha256 AS sha256, v.size AS size,",
+            "       v.withdrawn AS version_withdrawn",
+            "FROM materials m JOIN versions v ON v.version_id = m.current_version_id",
+            "WHERE 1=1",
+        ]
+        params: list = []
+        if institution_id is not None:
+            sql.append("AND m.institution_id = ?")
+            params.append(institution_id)
+        if kind is not None:
+            sql.append("AND m.kind = ?")
+            params.append(kind)
+        if sensitivity is not None:
+            sql.append("AND m.sensitivity = ?")
+            params.append(sensitivity)
+        if not include_withdrawn:
+            sql.append("AND m.withdrawn = 0 AND v.withdrawn = 0")
+        sql.append("ORDER BY m.material_id")
+        rows = self._conn.execute("\n".join(sql), params).fetchall()
+        return [
+            CurrentVersionRow(
+                material_id=r["material_id"],
+                institution_id=r["institution_id"],
+                kind=r["kind"],
+                sensitivity=r["sensitivity"],
+                title=r["title"],
+                material_withdrawn=bool(r["material_withdrawn"]),
+                version_id=r["version_id"],
+                version_no=int(r["version_no"]),
+                sha256=r["sha256"],
+                size=int(r["size"]),
+                version_withdrawn=bool(r["version_withdrawn"]),
             )
             for r in rows
         ]

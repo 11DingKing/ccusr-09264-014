@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import abc
 from contextlib import AbstractContextManager
+from typing import TYPE_CHECKING
 
 from ..domain.models import (
     AuditEntry,
@@ -16,10 +17,15 @@ from ..domain.models import (
     MaterialVersion,
     Objection,
     PackageEntry,
+    ReportSnapshot,
     ReviewPackage,
     ReviewRequest,
+    SnapshotFrozenRow,
     User,
 )
+
+if TYPE_CHECKING:
+    from ..domain.snapshot import CurrentVersionRow
 
 
 class Repository(abc.ABC):
@@ -148,3 +154,35 @@ class Repository(abc.ABC):
     def list_audit(
         self, package_id: str | None = None, limit: int = 200
     ) -> list[AuditEntry]: ...
+
+    # ---- 报送快照 ----
+    @abc.abstractmethod
+    def insert_snapshot(self, snapshot: ReportSnapshot) -> None: ...
+
+    @abc.abstractmethod
+    def insert_snapshot_rows(self, rows: list[SnapshotFrozenRow]) -> None: ...
+
+    @abc.abstractmethod
+    def get_snapshot(self, snapshot_id: str) -> ReportSnapshot | None: ...
+
+    @abc.abstractmethod
+    def list_snapshots(
+        self, institution_id: str | None = None,
+    ) -> list[ReportSnapshot]: ...
+
+    @abc.abstractmethod
+    def get_snapshot_rows(self, snapshot_id: str) -> list[SnapshotFrozenRow]: ...
+
+    @abc.abstractmethod
+    def select_current_versions_for_snapshot(
+        self,
+        *,
+        institution_id: str | None,
+        kind: str | None,
+        sensitivity: str | None,
+        include_withdrawn: bool,
+    ) -> list[CurrentVersionRow]:
+        """快照生成时【仅在此时刻】读取源数据的当前版本，供逐行冻结。
+
+        返回的行随后复制进 snapshot_frozen_rows；摘要/下载不再访问源表。
+        """

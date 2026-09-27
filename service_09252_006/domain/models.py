@@ -146,5 +146,43 @@ class AuditEntry:
     detail: dict = field(default_factory=dict)
 
 
+@dataclass
+class ReportSnapshot:
+    """报送快照：筛选条件与数据版本在生成时刻被冻结。
+
+    filters 为规范化后的筛选条件；fingerprint 覆盖“筛选条件 + 冻结行 +
+    生成时刻”。快照行存于独立冻结表，源数据之后如何变化都不影响它。
+    """
+
+    snapshot_id: str
+    scope: str                     # domain.snapshot.SCOPE_*
+    institution_id: str            # 冻结的机构范围；空串表示跨机构全量
+    filters: dict
+    status: str                    # "frozen"（一次性写入，不可变）
+    created_by: str
+    created_at: str
+    fingerprint: str
+    row_count: int
+    deadline_at_utc: Optional[str] = None
+    deadline_timezone: Optional[str] = None
+
+
+@dataclass
+class SnapshotFrozenRow:
+    """快照对命中材料【当时当前版本】的逐行冻结副本（不与源表建外键）。"""
+
+    snapshot_id: str
+    material_id: str
+    institution_id: str
+    kind: str
+    sensitivity: str
+    title: str
+    version_id: str
+    version_no: int
+    sha256: str
+    size: int
+    withdrawn: bool                # 生成时刻“材料或版本已撤回”即记为 True
+
+
 def asdict(obj) -> dict:
     return dataclasses.asdict(obj)

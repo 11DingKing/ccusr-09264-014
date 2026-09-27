@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass, field
 
@@ -14,6 +15,7 @@ from ..domain.fingerprint import (
     manifest_fingerprint,
     review_record_fingerprint,
 )
+from ..domain.snapshot import snapshot_fingerprint
 
 
 @dataclass
@@ -23,6 +25,7 @@ class VerificationReport:
     package_count: int = 0
     sealed_count: int = 0
     decided_count: int = 0
+    snapshot_count: int = 0
     withdrawn_in_sealed: list[dict] = field(default_factory=list)
     failures: list[dict] = field(default_factory=list)
     warnings: list[dict] = field(default_factory=list)
@@ -45,6 +48,7 @@ class VerificationReport:
             "package_count": self.package_count,
             "sealed_count": self.sealed_count,
             "decided_count": self.decided_count,
+            "snapshot_count": self.snapshot_count,
             "withdrawn_in_sealed": self.withdrawn_in_sealed,
             "failures": self.failures,
             "warnings": self.warnings,
@@ -59,6 +63,7 @@ def verify_database(path: str) -> VerificationReport:
     try:
         _verify_blobs(conn, report)
         _verify_packages(conn, report)
+        _verify_snapshots(conn, report)
     finally:
         conn.close()
     return report
@@ -241,3 +246,61 @@ def _verify_packages(conn: sqlite3.Connection, report: VerificationReport) -> No
                     stored=pkg["review_fingerprint"],
                     expected=expected_review,
                 )
+
+
+def _verify_snapshots(conn: sqlite3.Connection, report: VerificationReport) -> None:
+    # 只读打开旧版（v1）库时可能还没有快照表
+    existing = {
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    if "report_snapshots" not in existing or "snapshot_frozen_rows" not in existing:
+        return
+
+    snapshots = conn.execute("SELECT * FROM report_snapshots").fetchall()
+    report.snapshot_count = len(snapshots)
+    for snap in snapshots:
+        rows = conn.execute(
+            "SELECT * FROM snapshot_frozen_rows WHERE snapshot_id = ?"
+            " ORDER BY material_id",
+            (snap["snapshot_id"],),
+        ).fetchall()
+
+        if snap["row_count"] != len(rows):
+            report.fail(
+                "snapshot_row_count_mismatch",
+                snapshot_id=snap["snapshot_id"],
+                stored=snap["row_count"],
+                actual=len(rows),
+            )
+
+        filters = json.loads(snap["filters_json"])
+        expected = snapshot_fingerprint(
+            snap["snapshot_id"],
+            filters,
+            [
+                {
+                    "material_id": r["material_id"],
+                    "institution_id": r["institution_id"],
+                    "kind": r["kind"],
+                    "sensitivity": r["sensitivity"],
+                    "title": r["title"],
+                    "version_id": r["version_id"],
+                    "version_no": r["version_no"],
+                    "sha256": r["sha256"],
+                    "size": r["size"],
+                    "withdrawn": bool(r["withdrawn"]),
+                }
+                for r in rows
+            ],
+            snap["created_at"],
+        )
+        if snap["fingerprint"] != expected:
+            report.fail(
+                "snapshot_fingerprint_mismatch",
+                snapshot_id=snap["snapshot_id"],
+                stored=snap["fingerprint"],
+                expected=expected,
+            )

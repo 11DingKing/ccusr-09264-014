@@ -20,6 +20,19 @@
 - 签发结论时对全部评审请求与异议再哈希，得到 **review_fingerprint**，
   其中嵌入 manifest_fingerprint，形成证据链。
 
+### 报送快照冻结
+- 报送截止前调用生成快照：命中筛选条件（机构/类型/敏感度/是否含撤回）
+  的材料，其**当时当前版本**被逐行复制进独立冻结表 `snapshot_frozen_rows`，
+  与规范化筛选条件、生成时刻一起做 **snapshot_fingerprint**，冻结在
+  `report_snapshots` 表（`schema quality-reporting-snapshot/v1`）。
+- 生成快照是唯一读取源数据的时刻；此后源数据上传新版本、撤回版本、
+  登记新材料，都只影响源表——**已报送摘要永远由冻结行确定性汇总**，
+  Python/HTTP 下载返回字节固定的摘要（同一快照两次下载逐字节一致）。
+- 冻结行不与源表建外键：源行事后撤回或清理也不能改动、删除已报送快照。
+- 快照须在报送截止（当地时间 + IANA 时区换算的 UTC 绝对时刻）之前生成，
+  过期请求被 `409 deadline_exceeded` 拒绝；支持 `Idempotency-Key` 重放。
+- 离线核验会重算快照指纹，篡改冻结行或筛选条件即判完整性失败。
+
 ### 后补文件只能复审
 - 已封存/已决定的包拒绝追加材料（`409 immutability_violation`）。
 - 后补材料走“复审包”：`supersedes_package_id` 指向旧包；旧包中**未撤回**
@@ -106,6 +119,14 @@ python3 -m service_09252_006.cli verify --db ./data/qe.db [--json]
 | POST | `/v1/requests/{id}/verdict` | 提交 approve/object（object 须先有异议） |
 | POST | `/v1/requests/{id}/cancel` | 取消分配（即时收回敏感访问权） |
 | POST | `/v1/packages/{id}/decision` | 签发 approved/needs_revision/rejected |
+| POST | `/v1/snapshots` | 生成报送快照（body 可带 `filters`、报送截止） |
+| GET  | `/v1/snapshots` | 列出本机构（权威/审计为全部）报送快照 |
+| GET  | `/v1/snapshots/{id}` | 快照元数据（冻结的筛选条件与指纹） |
+| GET  | `/v1/snapshots/{id}/summary` | 下载固定摘要（字节不变，源数据变化无影响） |
+
+`filters` 支持 `kind` / `sensitivity` / `institution_id` /
+`include_withdrawn`（机构用户强制收敛到本机构，权威机构/审计可全量）；
+截止随 `deadline_local_iso` + `deadline_timezone` 提供。
 
 评审状态机：`draft → sealed → under_review → decided`；复审包重新走一遍，
 旧包不复活。
@@ -120,7 +141,8 @@ python3 -m compileall -q service_09252_006 tests
 覆盖：内容寻址与版本链、封存不变量、**材料撤回**（封存前后）、后补材料
 只能复审、**最小披露与权限变化**（取消/拒绝/角色调整/跨机构）、
 **跨时区截止**（上海/伦敦/洛杉矶）、异议与签发约束、幂等重放与失败重试、
-多连接**并发复审**、离线核验对字节/清单/评审篡改的检出，以及完整 HTTP
-端到端流程。
+多连接**并发复审**、离线核验对字节/清单/评审篡改的检出，以及**报送快照
+冻结**（源数据新版本/撤回/新增后已报送摘要字节不变、截止前生成、离线
+指纹重算），并含完整 HTTP 端到端流程。
 
 扩展模块覆盖证据、审批、权限、留存、对账与恢复等业务边界。

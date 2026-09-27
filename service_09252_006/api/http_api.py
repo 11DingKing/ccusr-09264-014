@@ -394,6 +394,41 @@ class ApiHandler(BaseHTTPRequestHandler):
             ),
         )
 
+    # --------------------------------------------------------- 报送快照
+    def create_snapshot(self) -> None:
+        actor = self._actor()
+        body = self._read_json()
+        result = self.services.snapshots.create_snapshot(
+            actor,
+            filters=body.get("filters"),
+            deadline_local_iso=body.get("deadline_local_iso"),
+            deadline_timezone=body.get("deadline_timezone"),
+            idempotency_key=self._idempotency_key(),
+        )
+        self._send_json(201, result)
+
+    def list_snapshots(self) -> None:
+        actor = self._actor()
+        self._send_json(200, {"snapshots": self.services.snapshots.list_snapshots(actor)})
+
+    def get_snapshot(self, snapshot_id: str) -> None:
+        actor = self._actor()
+        self._send_json(200, self.services.snapshots.get_snapshot(actor, snapshot_id))
+
+    def download_snapshot_summary(self, snapshot_id: str) -> None:
+        actor = self._actor()
+        meta, data = self.services.snapshots.download_summary(actor, snapshot_id)
+        self._send_bytes(
+            200,
+            data,
+            meta["media_type"],
+            extra_headers={
+                "Content-Disposition": f'attachment; filename="{meta["filename"]}"',
+                "X-Snapshot-Fingerprint": meta["fingerprint"],
+                "X-Snapshot-Row-Count": str(meta["row_count"]),
+            },
+        )
+
 
 # 路由表：方法 -> [(路径模式, 处理方法名)]
 def _routes() -> dict[str, list[tuple[str, str]]]:
@@ -413,6 +448,7 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
         ("/v1/requests/{request_id}/respond", "respond_request"),
         ("/v1/requests/{request_id}/objections", "create_objection"),
         ("/v1/requests/{request_id}/verdict", "submit_verdict"),
+        ("/v1/snapshots", "create_snapshot"),
     ]
     get = [
         ("/v1/materials/{material_id}", "get_material"),
@@ -424,6 +460,9 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
             "/v1/packages/{package_id}/entries/{version_id}/content",
             "download_entry",
         ),
+        ("/v1/snapshots", "list_snapshots"),
+        ("/v1/snapshots/{snapshot_id}", "get_snapshot"),
+        ("/v1/snapshots/{snapshot_id}/summary", "download_snapshot_summary"),
     ]
     return {"POST": post, "GET": get}
 
