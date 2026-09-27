@@ -136,6 +136,41 @@ class Blob:
 
 
 @dataclass
+class SnapshotEntry:
+    """报送快照对材料【生成时刻版本】的固定引用。"""
+
+    snapshot_id: str
+    material_id: str
+    version_id: str
+    sha256: str
+    kind: str
+    sensitivity: str
+    title: str
+    media_type: str
+    version_no: int
+    size: int
+    ordinal: int                   # 快照内稳定序号（按 material/version 排序）
+
+
+@dataclass
+class ReportSnapshot:
+    """报送快照：筛选条件、数据版本与摘要在生成时一次性冻结。"""
+
+    snapshot_id: str
+    institution_id: str
+    title: str
+    filters: dict                  # 冻结的筛选条件
+    summary: dict                  # 冻结的固定摘要（同时落库为 summary_json）
+    fingerprint: str               # 筛选条件 + 版本集合 + 生成时刻的指纹
+    summary_fingerprint: str       # 固定摘要 JSON 内容的指纹（独立列，不自引用）
+    entry_count: int
+    total_size: int
+    created_by: str
+    created_at: str
+    entries: list[SnapshotEntry] = field(default_factory=list)
+
+
+@dataclass
 class AuditEntry:
     audit_id: str
     package_id: Optional[str]

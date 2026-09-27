@@ -82,7 +82,8 @@ def _print_human(report) -> None:
     print("==============")
     print(f"结论: {'通过' if d['ok'] else '发现问题'}")
     print(f"内容对象: {d['blob_count']}  评审包: {d['package_count']}"
-          f"  已封存: {d['sealed_count']}  已签发: {d['decided_count']}")
+          f"  已封存: {d['sealed_count']}  已签发: {d['decided_count']}"
+          f"  报送快照: {d['snapshot_count']}")
     if d["withdrawn_in_sealed"]:
         print(f"提示: {len(d['withdrawn_in_sealed'])} 个封存清单条目引用的版本事后被撤回"
               "（历史指纹仍有效，需复审时应另建复审包）")

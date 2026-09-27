@@ -123,3 +123,46 @@ def is_valid_digest(value: str) -> bool:
     if algo != ALGORITHM:
         return False
     return len(hexdigest) == 64 and all(c in "0123456789abcdef" for c in hexdigest)
+
+
+def snapshot_fingerprint(
+    snapshot_id: str,
+    institution_id: str,
+    filters: Mapping[str, Any],
+    entries: Iterable[Mapping[str, Any]],
+    created_at: str,
+) -> str:
+    """报送快照指纹：把【筛选条件 + 数据版本集合 + 生成时刻】一次性固化。
+
+    entries 必须包含 material_id / version_id / sha256 / kind / sensitivity /
+    version_no；函数内部排序，调用方顺序不影响指纹。源数据（版本链、撤回
+    标记、blob 字节）随后如何变化都不会改变该指纹。
+    """
+    normalized_entries = sorted(
+        (
+            {
+                "material_id": str(e["material_id"]),
+                "version_id": str(e["version_id"]),
+                "sha256": str(e["sha256"]),
+                "kind": str(e["kind"]),
+                "sensitivity": str(e["sensitivity"]),
+                "version_no": int(e["version_no"]),
+            }
+            for e in entries
+        ),
+        key=lambda e: (e["material_id"], e["version_id"]),
+    )
+    payload = {
+        "schema": "quality-evidence-report-snapshot/v1",
+        "snapshot_id": snapshot_id,
+        "institution_id": institution_id,
+        "created_at": created_at,
+        "filters": filters,
+        "entries": normalized_entries,
+    }
+    return ALGORITHM + ":" + digest_json(payload)
+
+
+def summary_fingerprint(summary: Mapping[str, Any]) -> str:
+    """报送摘要内容的指纹：摘要 JSON 字节变化即可被离线核验发现。"""
+    return ALGORITHM + ":" + digest_json(summary)

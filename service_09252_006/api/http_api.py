@@ -306,6 +306,62 @@ class ApiHandler(BaseHTTPRequestHandler):
             },
         )
 
+    # --------------------------------------------------------- 报送快照
+    def create_snapshot(self) -> None:
+        actor = self._actor()
+        body = self._read_json()
+        result = self.services.snapshots.create_snapshot(
+            actor,
+            title=body["title"],
+            kinds=body.get("kinds"),
+            sensitivity=body.get("sensitivity"),
+            idempotency_key=self._idempotency_key(),
+        )
+        self._send_json(201, result)
+
+    def list_snapshots(self) -> None:
+        actor = self._actor()
+        self._send_json(
+            200, {"snapshots": self.services.snapshots.list_snapshots(actor)}
+        )
+
+    def get_snapshot(self, snapshot_id: str) -> None:
+        actor = self._actor()
+        self._send_json(
+            200, self.services.snapshots.get_snapshot(actor, snapshot_id)
+        )
+
+    def download_snapshot_summary(self, snapshot_id: str) -> None:
+        actor = self._actor()
+        meta, data = self.services.snapshots.download_summary(
+            actor, snapshot_id=snapshot_id
+        )
+        self._send_bytes(
+            200,
+            data,
+            "application/json; charset=utf-8",
+            extra_headers={
+                "X-Snapshot-Id": meta["snapshot_id"],
+                "X-Snapshot-Fingerprint": meta["fingerprint"],
+            },
+        )
+
+    def download_snapshot_entry(self, snapshot_id: str, version_id: str) -> None:
+        actor = self._actor()
+        meta, data, media_type = self.services.snapshots.download_entry(
+            actor, snapshot_id=snapshot_id, version_id=version_id
+        )
+        self._send_bytes(
+            200,
+            data,
+            media_type,
+            extra_headers={
+                "X-Snapshot-Id": meta["snapshot_id"],
+                "X-Version-Id": meta["version_id"],
+                "X-Content-Sha256": meta["sha256"],
+            },
+        )
+
     # ----------------------------------------------------------- 评审
     def assign(self, package_id: str) -> None:
         actor = self._actor()
@@ -409,6 +465,7 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
         ("/v1/packages/{package_id}/seal", "seal_package"),
         ("/v1/packages/{package_id}/assignments", "assign"),
         ("/v1/packages/{package_id}/decision", "issue_decision"),
+        ("/v1/snapshots", "create_snapshot"),
         ("/v1/requests/{request_id}/cancel", "cancel_request"),
         ("/v1/requests/{request_id}/respond", "respond_request"),
         ("/v1/requests/{request_id}/objections", "create_objection"),
@@ -423,6 +480,13 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
         (
             "/v1/packages/{package_id}/entries/{version_id}/content",
             "download_entry",
+        ),
+        ("/v1/snapshots", "list_snapshots"),
+        ("/v1/snapshots/{snapshot_id}", "get_snapshot"),
+        ("/v1/snapshots/{snapshot_id}/summary", "download_snapshot_summary"),
+        (
+            "/v1/snapshots/{snapshot_id}/entries/{version_id}/content",
+            "download_snapshot_entry",
         ),
     ]
     return {"POST": post, "GET": get}

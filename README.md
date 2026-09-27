@@ -37,6 +37,19 @@
   失权；角色调整在下次请求鉴权时即时生效。
 - 无权限者看到的清单条目不返回摘要（避免内容指纹本身泄露）。
 
+### 报送快照（截止前冻结）
+- 报送截止前由机构管理员生成**报送快照**：生成时刻按筛选条件（材料类别、
+  敏感度）选取每份未撤回材料的**当前有效版本**，把筛选条件、版本集合
+  （material/version/sha256/kind/sensitivity/version_no）与生成时刻一起
+  规范化哈希，得到 **snapshot_fingerprint**。
+- 快照把**固定摘要**（JSON）与**内容字节副本**一并写入 SQLite。生成后：
+  上传新版本、撤回版本、新增材料、甚至删除/改写源 `blobs` 字节，都**不
+  改变已报送快照**；摘要下载与条目内容下载永远返回冻结版本。
+- 要反映新数据只能再生成一份新快照；快照不可修改、不可删除。
+- 报送摘要含敏感反馈的内容指纹，仅机构管理员/质量权威/审计可见。
+- 离线核验重算快照指纹、摘要指纹，并只依赖快照自有字节副本校验内容，
+  篡改摘要、冻结清单或副本均会被检出（退出码 2）。
+
 ### 并发、幂等与恢复
 - 所有写用例在 `BEGIN IMMEDIATE` 事务内执行；状态推进使用条件 UPDATE
   （`WHERE status = expected`），并发分配/签发下只有一方推进，另一方回放，
@@ -106,6 +119,11 @@ python3 -m service_09252_006.cli verify --db ./data/qe.db [--json]
 | POST | `/v1/requests/{id}/verdict` | 提交 approve/object（object 须先有异议） |
 | POST | `/v1/requests/{id}/cancel` | 取消分配（即时收回敏感访问权） |
 | POST | `/v1/packages/{id}/decision` | 签发 approved/needs_revision/rejected |
+| POST | `/v1/snapshots` | 截止前生成报送快照（kinds/sensitivity 冻结） |
+| GET  | `/v1/snapshots` | 报送快照列表（管理员限本机构，权威/审计全部） |
+| GET  | `/v1/snapshots/{id}` | 快照元数据（冻结筛选条件与指纹） |
+| GET  | `/v1/snapshots/{id}/summary` | 下载固定摘要 JSON（源数据变化不影响） |
+| GET  | `/v1/snapshots/{id}/entries/{vid}/content` | 下载快照冻结的内容字节副本 |
 
 评审状态机：`draft → sealed → under_review → decided`；复审包重新走一遍，
 旧包不复活。
@@ -120,7 +138,7 @@ python3 -m compileall -q service_09252_006 tests
 覆盖：内容寻址与版本链、封存不变量、**材料撤回**（封存前后）、后补材料
 只能复审、**最小披露与权限变化**（取消/拒绝/角色调整/跨机构）、
 **跨时区截止**（上海/伦敦/洛杉矶）、异议与签发约束、幂等重放与失败重试、
-多连接**并发复审**、离线核验对字节/清单/评审篡改的检出，以及完整 HTTP
-端到端流程。
+多连接**并发复审**、离线核验对字节/清单/评审/**报送快照**篡改的检出，
+以及完整 HTTP 端到端流程。
 
 扩展模块覆盖证据、审批、权限、留存、对账与恢复等业务边界。

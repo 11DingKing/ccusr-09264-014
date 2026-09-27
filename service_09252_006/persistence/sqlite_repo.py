@@ -22,12 +22,14 @@ from ..domain.models import (
     MaterialVersion,
     Objection,
     PackageEntry,
+    ReportSnapshot,
     ReviewPackage,
     ReviewRequest,
+    SnapshotEntry,
     User,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class SqliteRepository(Repository):
@@ -176,7 +178,47 @@ class SqliteRepository(Repository):
                     created_at  TEXT NOT NULL
                 );
 
-                PRAGMA user_version = 1;
+                -- 报送快照：筛选条件与数据版本在生成时刻冻结
+                CREATE TABLE IF NOT EXISTS report_snapshots (
+                    snapshot_id         TEXT PRIMARY KEY,
+                    institution_id      TEXT NOT NULL,
+                    title               TEXT NOT NULL,
+                    filters_json        TEXT NOT NULL,
+                    summary_json        TEXT NOT NULL,
+                    fingerprint         TEXT NOT NULL,
+                    summary_fingerprint TEXT NOT NULL,
+                    entry_count         INTEGER NOT NULL,
+                    total_size          INTEGER NOT NULL,
+                    created_by          TEXT NOT NULL,
+                    created_at          TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS report_snapshot_entries (
+                    snapshot_id TEXT NOT NULL REFERENCES report_snapshots(snapshot_id),
+                    ordinal     INTEGER NOT NULL,
+                    material_id TEXT NOT NULL,
+                    version_id  TEXT NOT NULL,
+                    sha256      TEXT NOT NULL,
+                    kind        TEXT NOT NULL,
+                    sensitivity TEXT NOT NULL,
+                    title       TEXT NOT NULL,
+                    media_type  TEXT NOT NULL,
+                    version_no  INTEGER NOT NULL,
+                    size        INTEGER NOT NULL,
+                    PRIMARY KEY (snapshot_id, ordinal)
+                );
+
+                -- 快照自有的内容字节副本：源 blobs 事后被删/被改不影响报送
+                CREATE TABLE IF NOT EXISTS report_snapshot_blobs (
+                    snapshot_id TEXT NOT NULL REFERENCES report_snapshots(snapshot_id),
+                    sha256      TEXT NOT NULL,
+                    data        BLOB NOT NULL,
+                    media_type  TEXT NOT NULL,
+                    size        INTEGER NOT NULL,
+                    PRIMARY KEY (snapshot_id, sha256)
+                );
+
+                PRAGMA user_version = 2;
             """
         )
 
@@ -626,9 +668,170 @@ class SqliteRepository(Repository):
             for r in rows
         ]
 
-    # ------------------------------------------------------------------ audit
-    def insert_audit(self, entry: AuditEntry) -> None:
+    # ----------------------------------------------------------- 报送快照
+    def insert_snapshot(self, snapshot: ReportSnapshot) -> None:
         self._conn.execute(
+            "INSERT INTO report_snapshots(snapshot_id, institution_id, title,"
+            " filters_json, summary_json, fingerprint, summary_fingerprint,"
+            " entry_count, total_size, created_by, created_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                snapshot.snapshot_id,
+                snapshot.institution_id,
+                snapshot.title,
+                json.dumps(snapshot.filters, ensure_ascii=False, sort_keys=True),
+                json.dumps(snapshot.summary, ensure_ascii=False, sort_keys=True),
+                snapshot.fingerprint,
+                snapshot.summary_fingerprint,
+                snapshot.entry_count,
+                snapshot.total_size,
+                snapshot.created_by,
+                snapshot.created_at,
+            ),
+        )
+        for e in snapshot.entries:
+            self._conn.execute(
+                "INSERT INTO report_snapshot_entries(snapshot_id, ordinal,"
+                " material_id, version_id, sha256, kind, sensitivity, title,"
+                " media_type, version_no, size) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    e.snapshot_id,
+                    e.ordinal,
+                    e.material_id,
+                    e.version_id,
+                    e.sha256,
+                    e.kind,
+                    e.sensitivity,
+                    e.title,
+                    e.media_type,
+                    e.version_no,
+                    e.size,
+                ),
+            )
+
+    def _row_to_snapshot(self, row: sqlite3.Row) -> ReportSnapshot:
+        return ReportSnapshot(
+            snapshot_id=row["snapshot_id"],
+            institution_id=row["institution_id"],
+            title=row["title"],
+            filters=json.loads(row["filters_json"]),
+            summary=json.loads(row["summary_json"]),
+            fingerprint=row["fingerprint"],
+            summary_fingerprint=row["summary_fingerprint"],
+            entry_count=row["entry_count"],
+            total_size=row["total_size"],
+            created_by=row["created_by"],
+            created_at=row["created_at"],
+            entries=[],
+        )
+
+    def _load_snapshot_entries(self, snapshot_id: str) -> list[SnapshotEntry]:
+        rows = self._conn.execute(
+            "SELECT * FROM report_snapshot_entries WHERE snapshot_id = ?"
+            " ORDER BY ordinal",
+            (snapshot_id,),
+        ).fetchall()
+        return [
+            SnapshotEntry(
+                snapshot_id=snapshot_id,
+                material_id=r["material_id"],
+                version_id=r["version_id"],
+                sha256=r["sha256"],
+                kind=r["kind"],
+                sensitivity=r["sensitivity"],
+                title=r["title"],
+                media_type=r["media_type"],
+                version_no=r["version_no"],
+                size=r["size"],
+                ordinal=r["ordinal"],
+            )
+            for r in rows
+        ]
+
+    def get_snapshot(self, snapshot_id: str) -> ReportSnapshot | None:
+        row = self._conn.execute(
+            "SELECT * FROM report_snapshots WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        snapshot = self._row_to_snapshot(row)
+        snapshot.entries = self._load_snapshot_entries(snapshot_id)
+        return snapshot
+
+    def list_snapshots(
+        self, institution_id: str | None = None,
+    ) -> list[ReportSnapshot]:
+        if institution_id is None:
+            rows = self._conn.execute(
+                "SELECT * FROM report_snapshots ORDER BY created_at"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM report_snapshots WHERE institution_id = ?"
+                " ORDER BY created_at",
+                (institution_id,),
+            ).fetchall()
+        return [
+            self._row_to_snapshot(r) for r in rows
+        ]
+
+    def find_live_materials_for_snapshot(
+        self,
+        institution_id: str,
+        *,
+        kinds: tuple[str, ...] | None = None,
+        sensitivity: str | None = None,
+    ) -> list[tuple[Material, MaterialVersion]]:
+        sql = (
+            "SELECT m.* FROM materials m"
+            " WHERE m.institution_id = ? AND m.withdrawn = 0"
+            " AND m.current_version_id IS NOT NULL"
+        )
+        params: list = [institution_id]
+        if kinds:
+            placeholders = ",".join("?" for _ in kinds)
+            sql += f" AND m.kind IN ({placeholders})"
+            params.extend(kinds)
+        if sensitivity is not None:
+            sql += " AND m.sensitivity = ?"
+            params.append(sensitivity)
+        sql += " ORDER BY m.material_id"
+        result: list[tuple[Material, MaterialVersion]] = []
+        for mrow in self._conn.execute(sql, params).fetchall():
+            material = _row_to_material(mrow)
+            version = self.get_version(material.current_version_id)  # type: ignore[arg-type]
+            if version is None or version.withdrawn:
+                continue
+            result.append((material, version))
+        return result
+
+    def put_snapshot_blob_copy(
+        self, snapshot_id: str, sha256: str, data: bytes, media_type: str
+    ) -> None:
+        actual = digest_bytes(data)
+        if actual != sha256:
+            raise ValueError("快照内容副本 sha256 与内容不一致，拒绝写入")
+        self._conn.execute(
+            "INSERT OR IGNORE INTO report_snapshot_blobs(snapshot_id, sha256,"
+            " data, media_type, size) VALUES(?,?,?,?,?)",
+            (snapshot_id, sha256, data, media_type, len(data)),
+        )
+
+    def get_snapshot_blob_copy(
+        self, snapshot_id: str, sha256: str
+    ) -> tuple[bytes, str] | None:
+        row = self._conn.execute(
+            "SELECT data, media_type FROM report_snapshot_blobs"
+            " WHERE snapshot_id = ? AND sha256 = ?",
+            (snapshot_id, sha256),
+        ).fetchone()
+        if row is None:
+            return None
+        return bytes(row["data"]), row["media_type"]
+
+    # ------------------------------------------------------------------ audit
+    def insert_audit(self, entry: AuditEntry) -> None:        self._conn.execute(
             "INSERT INTO audit_log(audit_id, package_id, institution_id, actor_id,"
             " action, at, detail_json) VALUES(?,?,?,?,?,?,?)",
             (
